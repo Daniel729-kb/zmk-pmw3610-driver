@@ -14,6 +14,10 @@
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/input/input.h>
 #include <zmk/keymap.h>
+#include <math.h>
+#ifndef M_PI
+#define M_PI 3.1415926536
+#endif
 #include "pmw3610.h"
 
 #include <zephyr/logging/log.h>
@@ -577,6 +581,62 @@ static enum pixart_input_mode get_input_mode_for_current_layer(const struct devi
     return MOVE;
 }
 
+static int8_t detect_direction(const int16_t cur_x, const int16_t cur_y, const int8_t prev_detected_direction) {
+    static int prev_x = 0;
+    static int prev_y = 0;
+    static int64_t prev_time = 0;
+
+    const int AUTO_DETECT_DIRECTION_NUMBERS = 8;
+    const int AUTO_DETECT_DIRECTION_ANGLE = 360 / AUTO_DETECT_DIRECTION_NUMBERS;
+
+    int64_t curr_time = k_uptime_get();
+
+    if (prev_time == 0) {
+        prev_time = curr_time;
+        prev_x = cur_x;
+        prev_y = cur_y;
+        return prev_detected_direction;
+    }
+
+    if ((curr_time - prev_time) > CONFIG_PMW3610_DIRECTION_DETECTION_SAMPLE_TIME_MS) {
+        prev_time = 0;
+        prev_x = 0;
+        prev_y = 0;
+        return prev_detected_direction;
+    }
+
+    if ((pow(cur_x - prev_x, 2) + pow(cur_y - prev_y, 2)) < pow(CONFIG_PMW3610_DIRECTION_DETECTION_DISTANCE_THRESHOLD, 2)) {
+        return prev_detected_direction;
+    }
+
+    double radian = atan2(cur_y - prev_y, cur_x - prev_x);
+    if (radian < 0) {
+        radian = radian + 2 * M_PI;
+    }
+
+    const double angle = floor(radian * 360 / (2 * M_PI));
+    // detected_layer = (int8_t)((angle + AUTO_DETECT_DIRECTION_ANGLE / 2) / AUTO_DETECT_DIRECTION_ANGLE);
+    if (23 <= angle && angle <= 67) {
+        return 3;
+    } else if (68 <= angle && angle <= 112) {
+        return 4;
+    } else if (113 <= angle && angle <= 157) {
+        return 5;
+    } else if (158 <= angle && angle <= 202) {
+        return 6;
+    } else if (203 <= angle && angle <= 247) {
+        return 7;
+    } else if (248 <= angle && angle <= 292) {
+        return 0;
+    } else if (293 <= angle && angle <= 337) {
+        return 1;
+    } else {
+        return 2;
+    }
+}
+
+static uint8_t last_orientation_layer = 0;  // 最後に適用された向きを記録
+
 static int pmw3610_report_data(const struct device *dev) {
     struct pixart_data *data = dev->data;
     uint8_t buf[PMW3610_BURST_SIZE];
@@ -589,6 +649,14 @@ static int pmw3610_report_data(const struct device *dev) {
     int32_t dividor;
     enum pixart_input_mode input_mode = get_input_mode_for_current_layer(dev);
     bool input_mode_changed = data->curr_mode != input_mode;
+
+    uint8_t current_layer = zmk_keymap_highest_layer_active();
+
+    if (input_mode == MOVE) {
+        // MOVEモードでは現在のレイヤーを記録
+        last_orientation_layer = current_layer;
+    }
+
     switch (input_mode) {
     case MOVE:
         set_cpi_if_needed(dev, CONFIG_PMW3610_CPI);
@@ -630,21 +698,55 @@ static int pmw3610_report_data(const struct device *dev) {
     int16_t raw_y =
         TOINT16((buf[PMW3610_Y_L_POS] + ((buf[PMW3610_XY_H_POS] & 0x0F) << 8)), 12) / dividor;
 
+    static int8_t detected_direction = -1;
+
+    if ((input_mode == MOVE) &&
+        (zmk_keymap_highest_layer_active() == CONFIG_PMW3610_DIRECTION_DETECTION_LAYER)) {
+
+        detected_direction = detect_direction(raw_x, raw_y, detected_direction);
+        return 0;
+    }
+
     int16_t x;
     int16_t y;
 
-    if (IS_ENABLED(CONFIG_PMW3610_ORIENTATION_0)) {
-        x = -raw_x;
-        y = raw_y;
-    } else if (IS_ENABLED(CONFIG_PMW3610_ORIENTATION_90)) {
+    // MOVE時は現在のレイヤー、SCROLL時はlast_orientation_layerに基づいて変換
+    // uint8_t layer_to_apply = (input_mode == SCROLL) ? last_orientation_layer : current_layer;
+    uint8_t layer_to_apply = (detected_direction == -1) ? last_orientation_layer : detected_direction;
+
+    switch (layer_to_apply) {
+    case 1: // 45°
+        x = ((raw_x + raw_y) * 100) / 141;
+        y = ((raw_y - raw_x) * 100) / 141;
+        break;
+    case 2: // 90°
         x = raw_y;
         y = -raw_x;
-    } else if (IS_ENABLED(CONFIG_PMW3610_ORIENTATION_180)) {
-        x = raw_x;
+        break;
+    case 3: // 135°
+        x = ((raw_y - raw_x) * 100) / 141;
+        y = -((raw_x + raw_y) * 100) / 141;
+        break;
+    case 4: // 180°
+        x = -raw_x;
         y = -raw_y;
-    } else if (IS_ENABLED(CONFIG_PMW3610_ORIENTATION_270)) {
+        break;
+    case 5: // 225°
+        x = -((raw_x + raw_y) * 100) / 141;
+        y = -((raw_y - raw_x) * 100) / 141;
+        break;
+    case 6: // 270°
         x = -raw_y;
         y = raw_x;
+        break;
+    case 7: // 315°
+        x = -((raw_y - raw_x) * 100) / 141;
+        y = ((raw_x + raw_y) * 100) / 141;
+        break;
+    default: // 0°
+        x = raw_x;
+        y = raw_y;
+        break;
     }
 
     if (IS_ENABLED(CONFIG_PMW3610_INVERT_X)) {
@@ -687,6 +789,7 @@ static int pmw3610_report_data(const struct device *dev) {
     }
 #endif
 
+
     if (x != 0 || y != 0) {
         if (input_mode != SCROLL) {
             input_report_rel(dev, INPUT_REL_X, x, false, K_FOREVER);
@@ -694,6 +797,7 @@ static int pmw3610_report_data(const struct device *dev) {
         } else {
             data->scroll_delta_x += x;
             data->scroll_delta_y += y;
+
             if (abs(data->scroll_delta_y) > CONFIG_PMW3610_SCROLL_TICK) {
                 input_report_rel(dev, INPUT_REL_WHEEL,
                                  data->scroll_delta_y > 0 ? PMW3610_SCROLL_Y_NEGATIVE : PMW3610_SCROLL_Y_POSITIVE,
@@ -705,8 +809,8 @@ static int pmw3610_report_data(const struct device *dev) {
                                  data->scroll_delta_x > 0 ? PMW3610_SCROLL_X_NEGATIVE : PMW3610_SCROLL_X_POSITIVE,
                                  true, K_FOREVER);
                 data->scroll_delta_x = 0;
-                data->scroll_delta_y = 0;
-            }
+                    data->scroll_delta_y = 0;
+                }
         }
     }
 
@@ -771,6 +875,14 @@ static int pmw3610_init(const struct device *dev) {
     struct pixart_data *data = dev->data;
     const struct pixart_config *config = dev->config;
     int err;
+
+    // 🆕 起動時にデフォルトレイヤーを適用
+    uint8_t default_layer = CONFIG_NAPE_DEFAULT_LAYER;
+    LOG_INF("Setting default layer to %d", default_layer);
+    zmk_keymap_layer_activate(default_layer);
+
+    // 🔹 ここで last_orientation_layer を初期化
+    last_orientation_layer = default_layer;
 
     // init device pointer
     data->dev = dev;
